@@ -29,3 +29,9 @@ The project is part of the *Foundations in Deep Learning* course and is implemen
 
 ## Repository Structure
 
+---
+
+## Project Checklist
+
+
+
