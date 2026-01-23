@@ -59,9 +59,7 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# --------------------------------------------------
 # Dataset / Transforms
-# --------------------------------------------------
 
 def build_transforms(dataset: str) -> Tuple[T.Compose, T.Compose, int, int, int]:
     """
@@ -127,9 +125,7 @@ def load_data(
     return train_set, val_set, test_set, num_classes, in_ch, img_size
 
 
-# --------------------------------------------------
 # MixUp (optional)
-# --------------------------------------------------
 
 def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     """
@@ -155,9 +151,7 @@ def mixup_loss(logits: torch.Tensor, y_a: torch.Tensor, y_b: torch.Tensor, lam: 
     )
 
 
-# --------------------------------------------------
 # Model
-# --------------------------------------------------
 
 class MLP(nn.Module):
     """Fully-connected MLP with static weight sparsity (MaskedLinear)."""
@@ -210,9 +204,7 @@ def effective_sparsity(model: nn.Module) -> float:
     return 1.0 - (nnz / total)
 
 
-# --------------------------------------------------
 # Train / Eval
-# --------------------------------------------------
 
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
@@ -298,9 +290,7 @@ def train_one_epoch(
     }
 
 
-# --------------------------------------------------
 # Training State
-# --------------------------------------------------
 
 @dataclass
 class BestState:
@@ -310,9 +300,7 @@ class BestState:
     state_dict_cpu: Optional[Dict[str, torch.Tensor]] = None
 
 
-# --------------------------------------------------
 # Main
-# --------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
