@@ -35,7 +35,43 @@ The project is part of the *Foundations in Deep Learning* course and is implemen
 
 ---
 
+.
+├── src/.              # MLP and CNN architectures
+├── pruning/           # Iterative pruning methods
+├── experiments/       # Experiment configurations and scripts
+├── results/           # Logged metrics and plots
+├── utils/             # Training and evaluation utilities
+└── README.md
+
+
 ## Project Checklist
 
 
+### Implementation
+- [x] Dense baseline implementation
+- [x] Iterative pruning (magnitude-based) implementation
+- [x] Configurable pruning schedule
+- [x] Support for MLP architectures
+- [x] Support for CNN architectures
+
+### Experiments
+- [x] Dense vs iterative pruning comparison
+- [x] Experiments across different sparsity levels
+- [x] Experiments across different model configurations (depth / width)
+- [x] Multiple runs for stability analysis (fixed seeds)
+- [x] Logging of sparsity level during training
+
+### Evaluation & Analysis
+- [x] Test accuracy evaluation
+- [x] Training and validation loss tracking
+- [x] Convergence speed analysis
+- [x] Training time measurement
+- [x] Memory usage / effective parameter count analysis
+
+### Reproducibility & Documentation
+- [x] Reproducible experiment setup
+- [x] Clear experiment configuration files
+- [x] Well-documented codebase
+- [x] Clean repository structure
+- [x] README documentation
 
