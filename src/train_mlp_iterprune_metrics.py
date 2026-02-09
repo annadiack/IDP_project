@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Dense MLP training (Fashion-MNIST / CIFAR-10) with metrics logging (M1/MPS-friendly).
+train_mlp_iterprune_metrics.py
+
+Iterative-pruning MLP training (Fashion-MNIST / CIFAR-10) with M1/MPS-friendly metrics.
 
 metrics.csv columns:
 epoch,lr,train_loss,train_acc,train_grad_norm,val_loss,val_acc,
 prune_step,pruned_now,mask_sparsity,
 epoch_time_sec,elapsed_time_sec,time_to_acc_sec,time_to_acc_epoch,
-epoch_peak_rss_mb,epoch_end_rss_mb,sys_used_mb,sys_avail_mb
+epoch_peak_rss_mb,epoch_end_rss_mb,sys_used_mb,sys_avail_mb,
+total_params,nnz_params,nnz_ratio
 
-Notes:
-- Dense baseline => prune_step=0, pruned_now=0.0, mask_sparsity=0.0
-- No FLOPs logging (removed)
-- No GPU utilization / CUDA memory logging (removed; not applicable on M1/MPS)
-- RAM logging uses psutil (process RSS + system used/available)
+Key points:
+- Unstructured GLOBAL magnitude pruning.
+- MPS-safe pruning: pruning threshold computed on CPU (kthvalue not supported on MPS).
+- No FLOPs, no GPU utilization/VRAM metrics.
+- RAM uses psutil RSS. If num_workers>0, includes worker RSS by default.
 """
 
 import argparse
@@ -22,7 +25,7 @@ import csv
 import os
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import torch
@@ -37,12 +40,19 @@ import psutil
 
 
 # -------------------------
-# RAM helpers
+# RAM helpers (TOTAL RSS)
 # -------------------------
-_PROC = psutil.Process(os.getpid())
+_MAIN_PROC = psutil.Process(os.getpid())
 
-def rss_mb() -> float:
-    return _PROC.memory_info().rss / (1024.0 * 1024.0)
+def rss_mb_total(include_children: bool = True) -> float:
+    total = _MAIN_PROC.memory_info().rss
+    if include_children:
+        for ch in _MAIN_PROC.children(recursive=True):
+            try:
+                total += ch.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    return total / (1024.0 * 1024.0)
 
 def sys_used_mb() -> float:
     return psutil.virtual_memory().used / (1024.0 * 1024.0)
@@ -54,7 +64,6 @@ def sys_avail_mb() -> float:
 # -------------------------
 # Reproducibility / device
 # -------------------------
-
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -63,18 +72,15 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 def get_device() -> torch.device:
-    # Prefer MPS on Apple Silicon if available
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # -------------------------
-# Data
+# Dataset / Transforms
 # -------------------------
-
 def build_transforms(dataset: str) -> Tuple[T.Compose, T.Compose, int, int, int]:
     dataset = dataset.lower()
 
@@ -118,7 +124,6 @@ def load_data(dataset: str, data_dir: str, val_fraction: float, seed: int):
 # -------------------------
 # MixUp (optional)
 # -------------------------
-
 def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     if alpha <= 0.0:
         return x, y, y, 1.0
@@ -127,7 +132,6 @@ def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float):
     mixed_x = lam * x + (1.0 - lam) * x[idx]
     return mixed_x, y, y[idx], lam
 
-
 def mixup_loss(logits: torch.Tensor, y_a: torch.Tensor, y_b: torch.Tensor, lam: float, label_smoothing: float):
     return lam * F.cross_entropy(logits, y_a, label_smoothing=label_smoothing) + (1.0 - lam) * F.cross_entropy(
         logits, y_b, label_smoothing=label_smoothing
@@ -135,34 +139,153 @@ def mixup_loss(logits: torch.Tensor, y_a: torch.Tensor, y_b: torch.Tensor, lam: 
 
 
 # -------------------------
-# Model
+# Prunable Linear + pruning utilities (self-contained)
 # -------------------------
+class PrunableLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.register_buffer("mask", torch.ones_like(self.weight))
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight * self.mask, self.bias)
+
+
+def prunable_modules(model: nn.Module) -> List[nn.Module]:
+    return [m for m in model.modules() if isinstance(m, PrunableLinear)]
+
+
+@torch.no_grad()
+def apply_all_masks_(model: nn.Module) -> None:
+    for m in prunable_modules(model):
+        m.weight.mul_(m.mask)
+
+
+@torch.no_grad()
+def global_sparsity(model: nn.Module) -> float:
+    total = 0
+    nnz = 0
+    for m in prunable_modules(model):
+        total += m.mask.numel()
+        nnz += int(m.mask.sum().item())
+    if total == 0:
+        return 0.0
+    return 1.0 - (nnz / total)
+
+
+class IterativePruneSchedule:
+    def __init__(self, final_sparsity: float, steps: int):
+        self.final_sparsity = final_sparsity
+        self.steps = steps
+
+    def fraction_per_step(self) -> float:
+        # prune same fraction of remaining each step:
+        # (1-p)^steps = (1-final_sparsity)
+        return 1.0 - (1.0 - self.final_sparsity) ** (1.0 / self.steps)
+
+
+@torch.no_grad()
+def global_magnitude_prune_(model: nn.Module, prune_fraction_of_remaining: float) -> Dict[str, float]:
+    """
+    Global unstructured magnitude pruning across ALL PrunableLinear weights.
+
+    MPS-safe: threshold computed on CPU (kthvalue not supported on MPS).
+    """
+    if prune_fraction_of_remaining <= 0.0:
+        return {"pruned_now": 0.0}
+
+    mags = []
+    for m in prunable_modules(model):
+        w = m.weight.detach()
+        alive = m.mask.detach().bool()
+        mags.append(w.abs()[alive].reshape(-1))
+
+    if not mags:
+        return {"pruned_now": 0.0}
+
+    all_mags = torch.cat(mags, dim=0)
+    n = all_mags.numel()
+    if n == 0:
+        return {"pruned_now": 0.0}
+
+    k = int(prune_fraction_of_remaining * n)
+    k = max(1, min(k, n))
+
+    # CPU threshold (MPS-safe)
+    thresh = torch.kthvalue(all_mags.to("cpu"), k).values.item()
+
+    pruned_count = 0
+    remaining_before = 0
+
+    for m in prunable_modules(model):
+        w = m.weight.detach()
+        mask = m.mask
+        alive = mask.bool()
+        remaining_before += int(alive.sum().item())
+
+        to_prune = alive & (w.abs() <= thresh)
+        if to_prune.any():
+            mask[to_prune] = 0.0
+            pruned_count += int(to_prune.sum().item())
+
+    apply_all_masks_(model)
+    pruned_now = 0.0 if remaining_before == 0 else (pruned_count / remaining_before)
+    return {"pruned_now": float(pruned_now)}
+
+
+# -------------------------
+# Model (prunable MLP)
+# -------------------------
 class MLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_classes: int, dropout: float):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, num_classes)
-        self.drop = nn.Dropout(p=dropout)
+        self.net = nn.Sequential(
+            PrunableLinear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+
+            PrunableLinear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+
+            PrunableLinear(hidden_dim, num_classes),
+        )
+        apply_all_masks_(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.flatten(x, start_dim=1)
-        x = F.relu(self.fc1(x), inplace=True)
-        x = self.drop(x)
-        x = F.relu(self.fc2(x), inplace=True)
-        x = self.drop(x)
-        return self.fc3(x)
+        return self.net(x)
 
 
-def count_params(model: nn.Module) -> int:
+# -------------------------
+# Param counting (per epoch)
+# -------------------------
+@torch.no_grad()
+def count_total_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+@torch.no_grad()
+def count_nnz_params(model: nn.Module, include_bias: bool = True) -> int:
+    nnz = 0
+    for m in model.modules():
+        if hasattr(m, "mask") and isinstance(getattr(m, "mask"), torch.Tensor) and hasattr(m, "weight"):
+            nnz += int(m.mask.sum().item())
+            if include_bias and getattr(m, "bias", None) is not None:
+                nnz += m.bias.numel()
+    if nnz > 0:
+        return nnz
+
+    # fallback (should not be used here)
+    for p in model.parameters():
+        if p.requires_grad:
+            if (not include_bias) and p.ndim == 1:
+                continue
+            nnz += int((p != 0).sum().item())
+    return nnz
 
 
 # -------------------------
 # Train/Eval
 # -------------------------
-
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
@@ -193,20 +316,21 @@ def train_one_epoch(
     device: torch.device,
     label_smoothing: float,
     mixup_alpha: float,
+    include_children_rss: bool,
 ) -> Dict[str, float]:
     model.train()
     total_loss, total_correct, total_n = 0.0, 0, 0
     total_grad_norm = 0.0
     num_batches = 0
 
-    epoch_peak_rss = rss_mb()
+    epoch_peak_rss = rss_mb_total(include_children=include_children_rss)
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
 
         if mixup_alpha > 0.0:
-            x_mix, y_a, y_b, lam = mixup_batch(x, y, alpha=mixup_alpha)
+            x_mix, y_a, y_b, lam = mixup_batch(x, y, mixup_alpha)
             logits = model(x_mix)
             loss = mixup_loss(logits, y_a, y_b, lam, label_smoothing=label_smoothing)
             correct = (logits.argmax(1) == y).sum().item()
@@ -216,23 +340,27 @@ def train_one_epoch(
             correct = (logits.argmax(1) == y).sum().item()
 
         loss.backward()
+
         total_grad_norm += grad_global_norm(model)
         num_batches += 1
 
         optimizer.step()
 
+        # enforce zeros
+        apply_all_masks_(model)
+
         total_loss += loss.item() * x.size(0)
         total_correct += correct
         total_n += x.size(0)
 
-        epoch_peak_rss = max(epoch_peak_rss, rss_mb())
+        epoch_peak_rss = max(epoch_peak_rss, rss_mb_total(include_children=include_children_rss))
 
     return {
         "loss": total_loss / max(1, total_n),
         "acc": total_correct / max(1, total_n),
         "grad_norm": total_grad_norm / max(1, num_batches),
         "epoch_peak_rss_mb": epoch_peak_rss,
-        "epoch_end_rss_mb": rss_mb(),
+        "epoch_end_rss_mb": rss_mb_total(include_children=include_children_rss),
         "sys_used_mb": sys_used_mb(),
         "sys_avail_mb": sys_avail_mb(),
     }
@@ -241,7 +369,6 @@ def train_one_epoch(
 # -------------------------
 # Best checkpoint
 # -------------------------
-
 @dataclass
 class BestState:
     best_val_acc: float = -1.0
@@ -252,7 +379,6 @@ class BestState:
 # -------------------------
 # Main
 # -------------------------
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", type=str, default="fashionmnist")
@@ -270,14 +396,34 @@ def main():
     p.add_argument("--mixup", type=float, default=0.0)
     p.add_argument("--early-stop-patience", type=int, default=5)
 
-    # Time-to-accuracy threshold (val_acc)
+    # iterative pruning
+    p.add_argument("--final-sparsity", type=float, default=0.9)
+    p.add_argument("--prune-steps", type=int, default=10)
+    p.add_argument("--prune-every", type=int, default=1)
+    p.add_argument("--prune-warmup", type=int, default=1)
+
     p.add_argument("--tta-acc", type=float, default=0.90)
 
-    # Output
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--include-children-rss", action="store_true", default=True)
+
     p.add_argument("--out-dir", type=str, default="../experiments/results")
-    p.add_argument("--run-name", type=str, default="mlp_dense_fullmetrics")
+    p.add_argument("--run-name", type=str, default="mlp_iter_fullmetrics")
     args = p.parse_args()
 
+    if args.mixup != 0.0 or args.label_smoothing != 0.0:
+        print("Mixup and label smoothing are disabled for this script; forcing both to 0.0.")
+    args.mixup = 0.0
+    args.label_smoothing = 0.0
+
+    if not (0.0 <= args.final_sparsity < 1.0):
+        raise ValueError("--final-sparsity must be in [0, 1).")
+    if args.prune_steps < 1:
+        raise ValueError("--prune-steps must be >= 1.")
+    if args.prune_every < 1:
+        raise ValueError("--prune-every must be >= 1.")
+    if args.prune_warmup < 0:
+        raise ValueError("--prune-warmup must be >= 0.")
     if not (0.0 <= args.tta_acc <= 1.0):
         raise ValueError("--tta-acc must be in [0, 1].")
 
@@ -292,18 +438,26 @@ def main():
     train_set, val_set, test_set, num_classes, in_ch, img_size = load_data(
         args.dataset, args.data_dir, args.val_fraction, args.seed
     )
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=2)
+
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     input_dim = in_ch * img_size * img_size
     model = MLP(input_dim=input_dim, hidden_dim=args.hidden_dim, num_classes=num_classes, dropout=args.dropout).to(device)
-    print(f"Total params: {count_params(model):,}")
+    apply_all_masks_(model)
+
+    total_params_const = count_total_params(model)
+    print(f"Total params: {total_params_const:,} | initial sparsity={global_sparsity(model):.4f}")
+
+    schedule = IterativePruneSchedule(final_sparsity=args.final_sparsity, steps=args.prune_steps)
+    prune_frac = schedule.fraction_per_step()
+    print(f"Iter-prune: target={args.final_sparsity:.2f}, steps={args.prune_steps}, fraction/step={prune_frac:.6f}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # CSV header (schema aligned with pruning runs; flops/gpu removed; RAM added)
+    # CSV header
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
@@ -314,44 +468,65 @@ def main():
             "epoch_time_sec", "elapsed_time_sec",
             "time_to_acc_sec", "time_to_acc_epoch",
             "epoch_peak_rss_mb", "epoch_end_rss_mb", "sys_used_mb", "sys_avail_mb",
+            "total_params", "nnz_params", "nnz_ratio",
         ])
 
     best = BestState()
     patience_left = args.early_stop_patience
 
-    t0_total = time.time()
+    t0_total = time.perf_counter()
     time_to_acc_sec: Optional[float] = None
     time_to_acc_epoch: Optional[int] = None
 
+    warmup_epoch = max(1, args.prune_warmup)
+
     for epoch in range(1, args.epochs + 1):
-        t0_epoch = time.time()
+        t0_epoch = time.perf_counter()
 
         train_m = train_one_epoch(
             model, train_loader, optimizer, device,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup,
+            include_children_rss=args.include_children_rss,
         )
         val_m = evaluate(model, val_loader, device)
-        scheduler_lr.step()
+        scheduler.step()
 
         lr_now = optimizer.param_groups[0]["lr"]
 
-        epoch_time_sec = time.time() - t0_epoch
-        elapsed_time_sec = time.time() - t0_total
+        # pruning
+        prune_step = 0
+        pruned_now = 0.0
+        is_after_warmup = epoch >= warmup_epoch
+        is_prune_epoch = is_after_warmup and ((epoch - warmup_epoch) % args.prune_every == 0)
+
+        if is_prune_epoch:
+            prune_step = ((epoch - warmup_epoch) // args.prune_every) + 1
+            if prune_step <= args.prune_steps:
+                stats = global_magnitude_prune_(model, prune_fraction_of_remaining=prune_frac)
+                pruned_now = float(stats.get("pruned_now", 0.0))
+                apply_all_masks_(model)
+
+        mask_sparsity = float(global_sparsity(model))
+
+        epoch_time_sec = float(time.perf_counter() - t0_epoch)
+        elapsed_time_sec = float(time.perf_counter() - t0_total)
 
         if time_to_acc_sec is None and val_m["acc"] >= args.tta_acc:
             time_to_acc_sec = elapsed_time_sec
             time_to_acc_epoch = epoch
 
-        # Dense baseline fields
-        prune_step = 0
-        pruned_now = 0.0
-        mask_sparsity = 0.0
+        # Params per epoch (after pruning)
+        total_params = total_params_const
+        nnz_params = count_nnz_params(model, include_bias=True)
+        nnz_ratio = (nnz_params / total_params) if total_params > 0 else 0.0
 
         print(
             f"Epoch {epoch:02d}/{args.epochs} | lr={lr_now:.5f} | "
             f"train_acc={train_m['acc']:.4f} val_acc={val_m['acc']:.4f} | "
-            f"epoch_time={epoch_time_sec:.2f}s | peak_rss={train_m['epoch_peak_rss_mb']:.1f}MB"
+            f"sparsity={mask_sparsity:.4f} | epoch_time={epoch_time_sec:.2f}s | "
+            f"peak_rss={train_m['epoch_peak_rss_mb']:.1f}MB | nnz={nnz_ratio:.3f}"
+            + (f" | prune_step={prune_step} pruned_now={pruned_now:.4f}" if prune_step > 0 else "")
         )
 
         with open(csv_path, "a", newline="") as f:
@@ -366,6 +541,7 @@ def main():
                 "" if time_to_acc_epoch is None else time_to_acc_epoch,
                 train_m["epoch_peak_rss_mb"], train_m["epoch_end_rss_mb"],
                 train_m["sys_used_mb"], train_m["sys_avail_mb"],
+                total_params, nnz_params, nnz_ratio,
             ])
 
         if val_m["acc"] > best.best_val_acc:
@@ -376,10 +552,8 @@ def main():
         else:
             patience_left -= 1
             if patience_left <= 0:
-                print(f"Early stopping at epoch {epoch} (no val acc improvement).")
+                print(f"Early stopping at epoch {epoch}.")
                 break
-
-    train_time_total = time.time() - t0_total
 
     if best.state_dict_cpu is not None:
         model.load_state_dict(best.state_dict_cpu)
@@ -389,11 +563,6 @@ def main():
     print("\n=== FINAL (Best Val Checkpoint) ===")
     print(f"Best val acc: {best.best_val_acc:.4f} at epoch {best.best_epoch}")
     print(f"Test acc:     {test_m['acc']:.4f}")
-    print(f"Training time (total): {train_time_total:.2f} seconds")
-    if time_to_acc_sec is not None:
-        print(f"Time-to-accuracy (val_acc >= {args.tta_acc:.2f}): {time_to_acc_sec:.2f}s at epoch {time_to_acc_epoch}")
-    else:
-        print(f"Time-to-accuracy (val_acc >= {args.tta_acc:.2f}): not reached")
     print(f"Metrics saved to: {csv_path}")
 
 

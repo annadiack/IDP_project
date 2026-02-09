@@ -33,10 +33,10 @@ PLOTS = [
 
     ("epoch_peak_rss_mb", "Peak Process RAM per Epoch (RSS)", "MB"),
     ("epoch_end_rss_mb", "End-of-Epoch Process RAM (RSS)", "MB"),
-    ("sys_used_mb", "System Used RAM", "MB"),
-    ("sys_avail_mb", "System Available RAM", "MB"),
 
     ("mask_sparsity", "Iterative Mask Sparsity", "sparsity"),
+
+    ("nnz_params", "Number of non-zero parameters", "nnz_params"),
 ]
 
 

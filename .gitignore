@@ -13,10 +13,10 @@ datasets/
 **/MNIST/
 
 # Outputs / experiments
-experiments/results/
-runs/
-*.csv
-*.png
+# experiments/results/
+# runs/
+# *.csv
+# *.png
 
 # venv
 venv/
