@@ -120,7 +120,7 @@ def global_magnitude_prune_(
         return {"pruned_now": 0.0, "sparsity": global_sparsity(model)}
 
     # kth smallest magnitude among active weights -> threshold
-    thresh = torch.kthvalue(all_mags, k).values.item()
+    thresh = torch.kthvalue(all_mags.cpu(), k).values.item()
 
     pruned_count = 0
     for w, mask in meta:
