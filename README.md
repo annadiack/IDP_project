@@ -1,7 +1,6 @@
 # Effect of Static Weight Sparsity in Neural Networks  
 ### Deep Learning Project – University of Basel (Fall 2025)
 
----
 
 ## Overview
 
@@ -22,7 +21,7 @@ Our goal is not to design the most efficient sparse architecture, but rather to 
 
 The project is part of the *Foundations in Deep Learning* course and is implemented in **PyTorch**.
 
----
+
 
 ## Research Questions
 
@@ -31,7 +30,7 @@ The project is part of the *Foundations in Deep Learning* course and is implemen
 3. At what sparsity threshold does performance significantly degrade?
 4. How does sparsity influence optimization dynamics during training?
 
----
+
 
 ## Methodology
 
@@ -57,7 +56,7 @@ The project is part of the *Foundations in Deep Learning* course and is implemen
 
 This setup allows us to isolate the effect of reduced parameter capacity without introducing additional structural learning mechanisms.
 
----
+
 
 ## Experimental Design
 
@@ -70,7 +69,31 @@ For each sparsity level, we:
 
 To ensure consistency, all experiments use fixed seeds and controlled training settings.
 
----
 
-## Repository Structure
+## Project Checklist
+
+### Implementation
+- [x] Dense baseline MLP
+- [x] Static sparsity mask implementation
+- [x] Configurable sparsity levels
+- [x] Reproducible training pipeline
+
+### Experiments
+- [x] Dense vs sparse comparison
+- [x] Multiple sparsity levels
+- [x] Controlled hyperparameter settings
+- [x] Consistent initialization across runs
+
+### Evaluation & Analysis
+- [x] Test accuracy evaluation
+- [x] Training and validation loss tracking
+- [x] Analysis of optimization behavior
+- [x] Comparative sparsity plots
+
+### Reproducibility & Documentation
+- [x] Clear experiment setup
+- [x] Clean repository structure
+- [x] Well-documented code
+- [x] Updated README
+
 
