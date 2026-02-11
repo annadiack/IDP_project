@@ -10,12 +10,6 @@ prune_step,pruned_now,mask_sparsity,
 epoch_time_sec,elapsed_time_sec,time_to_acc_sec,time_to_acc_epoch,
 epoch_peak_rss_mb,epoch_end_rss_mb,sys_used_mb,sys_avail_mb,
 total_params,nnz_params,nnz_ratio
-
-Key points:
-- Unstructured GLOBAL magnitude pruning.
-- MPS-safe pruning: pruning threshold computed on CPU (kthvalue not supported on MPS).
-- No FLOPs, no GPU utilization/VRAM metrics.
-- RAM uses psutil RSS. If num_workers>0, includes worker RSS by default.
 """
 
 import argparse
